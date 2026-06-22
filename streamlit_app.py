@@ -24,7 +24,7 @@ PRODUCT_CSV_PATH = Path("data/priceList.csv")
 #    例:
 #    PRODUCT_CSV_URL = "https://raw.githubusercontent.com/ユーザー名/リポジトリ名/main/data/priceList.csv"
 #    使わない場合は空文字のままでOKです。
-PRODUCT_CSV_URL = "https://raw.githubusercontent.com/chordysk/mealMoneyUseUp/raw/refs/heads/main/data/priceList.csv"
+PRODUCT_CSV_URL = "https://github.com/chordysk/mealMoneyUseUp/raw/refs/heads/main/data/priceList.csv"
 
 # CSVキャッシュの有効時間 秒。
 # 0にするとキャッシュなし。300なら5分ごとに再取得。
