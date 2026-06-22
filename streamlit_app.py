@@ -15,6 +15,10 @@ TOP_RESULTS = 20              # 表示する候補数
 # 例: repo/data/priceList.csv に置く場合
 PRODUCT_CSV_PATH = Path("data/priceList.csv")
 
+# ショートカット金額ボタン
+TARGET_SHORTCUTS = [700, 1400, 2100]
+DEFAULT_TARGET_AMOUNT = 700
+
 # カテゴリ偏り防止条件
 MIN_ITEMS_FOR_CATEGORY_CHECK = 2   # 合計2点以上ならカテゴリチェック
 MIN_DISTINCT_CATEGORIES = 2        # 原則2カテゴリ以上
@@ -127,6 +131,14 @@ def is_category_balanced(combo, products):
     return True
 
 
+def shuffle_products_for_search(products):
+    """
+    探索前に商品リストの順番をランダム化する。
+    DPの保持数制限により先に探索された商品が出やすくなる偏りを軽減するため。
+    """
+    return products.sample(frac=1).reset_index(drop=True)
+
+
 # =========================================================
 # 組み合わせ探索
 # =========================================================
@@ -219,9 +231,25 @@ st.set_page_config(
 st.title("🛒 購買ぴったり使い切りアプリ")
 st.caption("GitHubリポジトリ内の固定CSVから、指定金額に近い組み合わせを探します。")
 
+# セッション状態の初期化
+if "target_amount" not in st.session_state:
+    st.session_state.target_amount = DEFAULT_TARGET_AMOUNT
+
 with st.sidebar:
     st.header("検索条件")
-    target_amount = st.number_input("使いたい金額 n 円", min_value=1, value=500, step=10)
+
+    st.write("ショートカット")
+    shortcut_cols = st.columns(len(TARGET_SHORTCUTS))
+    for col, amount in zip(shortcut_cols, TARGET_SHORTCUTS):
+        if col.button(f"{amount}円", use_container_width=True):
+            st.session_state.target_amount = amount
+
+    target_amount = st.number_input(
+        "使いたい金額 n 円",
+        min_value=1,
+        step=10,
+        key="target_amount"
+    )
 
     st.divider()
     st.write("固定条件")
@@ -231,6 +259,7 @@ with st.sidebar:
     st.write(f"- 表示候補数は最大 **{TOP_RESULTS}件**")
     st.write(f"- 2点以上なら原則 **{MIN_DISTINCT_CATEGORIES}カテゴリ以上**")
     st.write(f"- 1カテゴリの割合は **{int(MAX_CATEGORY_SHARE * 100)}%以下**")
+    st.write("- 探索前に商品リストを **ランダム化**")
 
 try:
     raw_df = read_csv_from_repo(str(PRODUCT_CSV_PATH))
@@ -246,9 +275,13 @@ try:
     col3.metric("価格範囲", f"{products['価格'].min()}〜{products['価格'].max()}円")
 
     if st.button("組み合わせを探す", type="primary"):
-        results = find_combinations(products, int(target_amount))
+        # 探索のたびに順番をランダム化して、固定の商品ばかり出る偏りを減らす
+        search_products = shuffle_products_for_search(products)
+        results = find_combinations(search_products, int(target_amount))
 
         st.subheader("検索結果")
+        st.caption("※ 探索前に商品順をランダム化しているため、同じ金額でも再検索すると候補が変わる場合があります。")
+
         if not results:
             st.warning(
                 "条件に合う組み合わせが見つかりませんでした。\n\n"
@@ -268,7 +301,7 @@ try:
 
             for i, r in enumerate(results, start=1):
                 with st.expander(f"候補{i}: 合計 {r['合計金額']}円 / {diff_label(r['差額'])}", expanded=(i == 1)):
-                    detail_df = combo_to_dataframe(r["combo"], products)
+                    detail_df = combo_to_dataframe(r["combo"], search_products)
                     st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
                     category_summary = (
