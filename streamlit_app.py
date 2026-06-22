@@ -11,18 +11,33 @@ UNDER_ALLOWANCE = 10          # 余りは10円以内
 OVER_ALLOWANCE = 5            # オーバーは5円まで
 TOP_RESULTS = 20              # 表示する候補数
 
-# GitHubリポジトリ内の商品CSVの場所
-# 例: repo/data/priceList.csv に置く場合
+# ---------------------------------------------------------
+# 商品CSVの読み込み設定
+# ---------------------------------------------------------
+# A. GitHubリポジトリ内のCSVを読む場合
+#    Streamlit Cloudでは、GitHub上のCSVを更新したあと「再デプロイ」されないと
+#    アプリ内のローカルファイル data/priceList.csv は古いままになることがあります。
 PRODUCT_CSV_PATH = Path("data/priceList.csv")
+
+# B. GitHubのRaw URLから直接CSVを読む場合
+#    CSV更新をアプリに反映しやすくしたい場合はこちらがおすすめです。
+#    例:
+#    PRODUCT_CSV_URL = "https://raw.githubusercontent.com/ユーザー名/リポジトリ名/main/data/priceList.csv"
+#    使わない場合は空文字のままでOKです。
+PRODUCT_CSV_URL = "https://raw.githubusercontent.com/chordysk/mealMoneyUseUp/raw/refs/heads/main/data/priceList.csv"
+
+# CSVキャッシュの有効時間 秒。
+# 0にするとキャッシュなし。300なら5分ごとに再取得。
+CSV_CACHE_TTL_SECONDS = 300
 
 # ショートカット金額ボタン
 TARGET_SHORTCUTS = [700, 1400, 2100]
 DEFAULT_TARGET_AMOUNT = 700
 
 # カテゴリ偏り防止条件
-MIN_ITEMS_FOR_CATEGORY_CHECK = 2   # 合計2点以上ならカテゴリチェック
-MIN_DISTINCT_CATEGORIES = 2        # 原則2カテゴリ以上
-MAX_CATEGORY_SHARE = 0.70          # 1カテゴリが全体の70%を超えたら除外
+MIN_ITEMS_FOR_CATEGORY_CHECK = 2
+MIN_DISTINCT_CATEGORIES = 2
+MAX_CATEGORY_SHARE = 0.70
 
 # 探索の上限。商品数が増えても重くなりすぎないようにするための設定
 MAX_COMBOS_PER_SUM = 200
@@ -36,29 +51,46 @@ CATEGORY_COLUMNS = ["カテゴリ", "カテゴリー", "分類", "category"]
 # =========================================================
 # CSV読み込み・整形
 # =========================================================
-@st.cache_data
-def read_csv_from_repo(csv_path: str):
-    """GitHubリポジトリ内に置いた固定CSVを読み込む。"""
-    path = Path(csv_path)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"商品CSVが見つかりません: {path}\n"
-            "GitHubリポジトリ内に data/priceList.csv を置いてください。"
-        )
-
+def read_csv_with_encodings(source):
+    """ローカルPathまたはURLから、日本語CSVを読み込む。"""
     encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     last_error = None
+
     for enc in encodings:
         try:
-            return pd.read_csv(path, encoding=enc)
+            return pd.read_csv(source, encoding=enc)
         except Exception as e:
             last_error = e
 
     raise ValueError(f"CSVを読み込めませんでした。UTF-8またはShift-JISで保存してください。詳細: {last_error}")
 
 
+# ttl=0はStreamlitのバージョンによって挙動差が出る可能性があるため、
+# キャッシュなしの場合は別関数で読む。
+@st.cache_data(ttl=CSV_CACHE_TTL_SECONDS)
+def read_csv_cached(source: str, source_type: str):
+    """商品CSVをキャッシュ付きで読み込む。source_typeはキャッシュキーを明確にするために使う。"""
+    if source_type == "url":
+        return read_csv_with_encodings(source)
+
+    path = Path(source)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"商品CSVが見つかりません: {path}\n"
+            "GitHubリポジトリ内に data/priceList.csv を置いてください。"
+        )
+    return read_csv_with_encodings(path)
+
+
+def read_products_source():
+    """設定に応じて、Raw URLまたはリポジトリ内CSVから読み込む。"""
+    if PRODUCT_CSV_URL.strip():
+        return read_csv_cached(PRODUCT_CSV_URL.strip(), "url"), PRODUCT_CSV_URL.strip()
+
+    return read_csv_cached(str(PRODUCT_CSV_PATH), "local"), str(PRODUCT_CSV_PATH)
+
+
 def pick_column(df, candidates):
-    """候補リストから実際に存在する列名を1つ選ぶ。"""
     for col in candidates:
         if col in df.columns:
             return col
@@ -66,7 +98,6 @@ def pick_column(df, candidates):
 
 
 def normalize_products(df):
-    """商品名・価格・カテゴリの列名を統一し、価格を数値化する。"""
     name_col = pick_column(df, NAME_COLUMNS)
     price_col = pick_column(df, PRICE_COLUMNS)
     category_col = pick_column(df, CATEGORY_COLUMNS)
@@ -112,7 +143,6 @@ def normalize_products(df):
 # カテゴリ偏り判定
 # =========================================================
 def is_category_balanced(combo, products):
-    """同じカテゴリばかりの組み合わせを除外する。"""
     total_items = sum(combo.values())
     if total_items < MIN_ITEMS_FOR_CATEGORY_CHECK:
         return True
@@ -125,17 +155,11 @@ def is_category_balanced(combo, products):
         return False
 
     max_share = max(category_counter.values()) / total_items
-    if max_share > MAX_CATEGORY_SHARE:
-        return False
-
-    return True
+    return max_share <= MAX_CATEGORY_SHARE
 
 
 def shuffle_products_for_search(products):
-    """
-    探索前に商品リストの順番をランダム化する。
-    DPの保持数制限により先に探索された商品が出やすくなる偏りを軽減するため。
-    """
+    """探索前に商品リストの順番をランダム化する。"""
     return products.sample(frac=1).reset_index(drop=True)
 
 
@@ -143,11 +167,8 @@ def shuffle_products_for_search(products):
 # 組み合わせ探索
 # =========================================================
 def find_combinations(products, target_amount):
-    """目標金額に近い商品の組み合わせを探す。"""
     min_total = max(0, target_amount - UNDER_ALLOWANCE)
     max_total = target_amount + OVER_ALLOWANCE
-
-    # dp[合計金額] = [ {商品index: 個数}, ... ]
     dp = {0: [dict()]}
 
     for idx, row in products.iterrows():
@@ -174,9 +195,7 @@ def find_combinations(products, target_amount):
     for total, combos in dp.items():
         if min_total <= total <= max_total:
             for combo in combos:
-                if not combo:
-                    continue
-                if not is_category_balanced(combo, products):
+                if not combo or not is_category_balanced(combo, products):
                     continue
 
                 diff = total - target_amount
@@ -192,7 +211,6 @@ def find_combinations(products, target_amount):
                     "combo": combo,
                 })
 
-    # ぴったりに近い順 → 余り優先 → カテゴリ数が多い順 → 点数が少ない順
     results.sort(key=lambda r: (r["絶対差額"], 1 if r["差額"] > 0 else 0, -r["カテゴリ数"], r["総点数"]))
     return results[:TOP_RESULTS]
 
@@ -229,9 +247,8 @@ st.set_page_config(
 )
 
 st.title("🛒 購買ぴったり使い切りアプリ")
-st.caption("GitHubリポジトリ内の固定CSVから、指定金額に近い組み合わせを探します。")
+st.caption("固定CSVから、指定金額に近い組み合わせを探します。")
 
-# セッション状態の初期化
 if "target_amount" not in st.session_state:
     st.session_state.target_amount = DEFAULT_TARGET_AMOUNT
 
@@ -252,6 +269,14 @@ with st.sidebar:
     )
 
     st.divider()
+    st.write("データ更新")
+    if st.button("商品CSVを再読み込み", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.caption(f"CSVキャッシュ有効時間: {CSV_CACHE_TTL_SECONDS}秒")
+
+    st.divider()
     st.write("固定条件")
     st.write(f"- 同じ商品は最大 **{MAX_PER_ITEM}点**")
     st.write(f"- 余りは **{UNDER_ALLOWANCE}円以内**")
@@ -262,11 +287,16 @@ with st.sidebar:
     st.write("- 探索前に商品リストを **ランダム化**")
 
 try:
-    raw_df = read_csv_from_repo(str(PRODUCT_CSV_PATH))
+    raw_df, source_label = read_products_source()
     products = normalize_products(raw_df)
 
     st.subheader("商品リスト")
-    st.caption(f"読み込み元: `{PRODUCT_CSV_PATH}`")
+    st.caption(f"読み込み元: `{source_label}`")
+    if PRODUCT_CSV_URL.strip():
+        st.info("GitHub Raw URLからCSVを読んでいます。CSV更新後、最大でキャッシュ有効時間ぶん反映が遅れる場合があります。すぐ反映したい場合はサイドバーの『商品CSVを再読み込み』を押してください。")
+    else:
+        st.warning("リポジトリ内CSVを読んでいます。Streamlit Cloudでは、GitHub上のCSV更新後にアプリの再デプロイが必要になる場合があります。CSVだけ頻繁に更新するなら PRODUCT_CSV_URL にGitHub Raw URLを設定してください。")
+
     st.dataframe(products, use_container_width=True, hide_index=True)
 
     col1, col2, col3 = st.columns(3)
@@ -275,7 +305,6 @@ try:
     col3.metric("価格範囲", f"{products['価格'].min()}〜{products['価格'].max()}円")
 
     if st.button("組み合わせを探す", type="primary"):
-        # 探索のたびに順番をランダム化して、固定の商品ばかり出る偏りを減らす
         search_products = shuffle_products_for_search(products)
         results = find_combinations(search_products, int(target_amount))
 
@@ -314,4 +343,4 @@ try:
 
 except Exception as e:
     st.error(f"エラーが発生しました: {e}")
-    st.info("GitHubリポジトリ内に `data/priceList.csv` があるか確認してください。")
+    st.info("`data/priceList.csv` があるか、または `PRODUCT_CSV_URL` が正しいか確認してください。")
