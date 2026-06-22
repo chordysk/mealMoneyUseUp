@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import io
+from pathlib import Path
 from collections import Counter
 
 # =========================================================
@@ -10,6 +10,10 @@ MAX_PER_ITEM = 2              # 同じ商品は最大2点まで
 UNDER_ALLOWANCE = 10          # 余りは10円以内
 OVER_ALLOWANCE = 5            # オーバーは5円まで
 TOP_RESULTS = 20              # 表示する候補数
+
+# GitHubリポジトリ内の商品CSVの場所
+# 例: repo/data/priceList.csv に置く場合
+PRODUCT_CSV_PATH = Path("data/priceList.csv")
 
 # カテゴリ偏り防止条件
 MIN_ITEMS_FOR_CATEGORY_CHECK = 2   # 合計2点以上ならカテゴリチェック
@@ -28,15 +32,21 @@ CATEGORY_COLUMNS = ["カテゴリ", "カテゴリー", "分類", "category"]
 # =========================================================
 # CSV読み込み・整形
 # =========================================================
-def read_csv_auto_encoding(uploaded_file):
-    """UTF-8 / Shift-JIS系のCSVを自動判定して読み込む。"""
-    data = uploaded_file.getvalue()
-    encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
+@st.cache_data
+def read_csv_from_repo(csv_path: str):
+    """GitHubリポジトリ内に置いた固定CSVを読み込む。"""
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"商品CSVが見つかりません: {path}\n"
+            "GitHubリポジトリ内に data/priceList.csv を置いてください。"
+        )
 
+    encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     last_error = None
     for enc in encodings:
         try:
-            return pd.read_csv(io.BytesIO(data), encoding=enc)
+            return pd.read_csv(path, encoding=enc)
         except Exception as e:
             last_error = e
 
@@ -107,11 +117,9 @@ def is_category_balanced(combo, products):
     for idx, qty in combo.items():
         category_counter[products.loc[idx, "カテゴリ"]] += qty
 
-    # 2点以上買う場合は、原則2カテゴリ以上にする
     if len(category_counter) < MIN_DISTINCT_CATEGORIES:
         return False
 
-    # 1カテゴリへの偏りが強すぎる場合は除外
     max_share = max(category_counter.values()) / total_items
     if max_share > MAX_CATEGORY_SHARE:
         return False
@@ -143,10 +151,8 @@ def find_combinations(products, target_amount):
 
                     new_combo = combo.copy()
                     new_combo[idx] = qty
-
                     new_dp.setdefault(new_sum, []).append(new_combo)
 
-                    # 重くなりすぎないよう、合計金額ごとに保持数を制限
                     if len(new_dp[new_sum]) > MAX_COMBOS_PER_SUM:
                         new_dp[new_sum] = new_dp[new_sum][:MAX_COMBOS_PER_SUM]
 
@@ -211,7 +217,7 @@ st.set_page_config(
 )
 
 st.title("🛒 購買ぴったり使い切りアプリ")
-st.caption("CSVの商品リストから、指定金額にできるだけ近い組み合わせを探します。")
+st.caption("GitHubリポジトリ内の固定CSVから、指定金額に近い組み合わせを探します。")
 
 with st.sidebar:
     st.header("検索条件")
@@ -226,17 +232,12 @@ with st.sidebar:
     st.write(f"- 2点以上なら原則 **{MIN_DISTINCT_CATEGORIES}カテゴリ以上**")
     st.write(f"- 1カテゴリの割合は **{int(MAX_CATEGORY_SHARE * 100)}%以下**")
 
-uploaded_file = st.file_uploader("商品リストCSVをアップロードしてください", type=["csv"])
-
-if uploaded_file is None:
-    st.info("まずCSVをアップロードしてください。例: 商品名, 価格（税込み）, カテゴリ")
-    st.stop()
-
 try:
-    raw_df = read_csv_auto_encoding(uploaded_file)
+    raw_df = read_csv_from_repo(str(PRODUCT_CSV_PATH))
     products = normalize_products(raw_df)
 
-    st.subheader("読み込んだ商品リスト")
+    st.subheader("商品リスト")
+    st.caption(f"読み込み元: `{PRODUCT_CSV_PATH}`")
     st.dataframe(products, use_container_width=True, hide_index=True)
 
     col1, col2, col3 = st.columns(3)
@@ -280,3 +281,4 @@ try:
 
 except Exception as e:
     st.error(f"エラーが発生しました: {e}")
+    st.info("GitHubリポジトリ内に `data/priceList.csv` があるか確認してください。")
