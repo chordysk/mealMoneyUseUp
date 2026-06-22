@@ -1,107 +1,118 @@
 import streamlit as st
 import pandas as pd
 import io
-import math
 from collections import Counter
 
 # =========================================================
-# 条件設定：ここを変えるだけで再計算条件を変更できる
+# 条件設定：ここを変えるだけで条件を調整できます
 # =========================================================
-
 MAX_PER_ITEM = 2              # 同じ商品は最大2点まで
 UNDER_ALLOWANCE = 10          # 余りは10円以内
 OVER_ALLOWANCE = 5            # オーバーは5円まで
-TOP_RESULTS = 10              # 表示する候補数
+TOP_RESULTS = 20              # 表示する候補数
 
 # カテゴリ偏り防止条件
 MIN_ITEMS_FOR_CATEGORY_CHECK = 2   # 合計2点以上ならカテゴリチェック
-MIN_DISTINCT_CATEGORIES = 2        # 2カテゴリ以上を推奨
+MIN_DISTINCT_CATEGORIES = 2        # 原則2カテゴリ以上
 MAX_CATEGORY_SHARE = 0.70          # 1カテゴリが全体の70%を超えたら除外
 
-# 計算量を抑えるため、各合計金額ごとに保持する組み合わせ数
-MAX_COMBOS_PER_SUM = 80
+# 探索の上限。商品数が増えても重くなりすぎないようにするための設定
+MAX_COMBOS_PER_SUM = 200
+
+# CSV列名候補
+NAME_COLUMNS = ["商品名", "品名", "商品", "name"]
+PRICE_COLUMNS = ["価格", "価格（税込み）", "価格(税込み)", "税込価格", "税込み価格", "値段", "price"]
+CATEGORY_COLUMNS = ["カテゴリ", "カテゴリー", "分類", "category"]
+
 
 # =========================================================
-# CSV読み込み
+# CSV読み込み・整形
 # =========================================================
-
 def read_csv_auto_encoding(uploaded_file):
-    """
-    UTF-8, Shift-JIS系のCSVを自動的に読み込む
-    """
+    """UTF-8 / Shift-JIS系のCSVを自動判定して読み込む。"""
     data = uploaded_file.getvalue()
     encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
 
+    last_error = None
     for enc in encodings:
         try:
             return pd.read_csv(io.BytesIO(data), encoding=enc)
-        except Exception:
-            pass
+        except Exception as e:
+            last_error = e
 
-    raise ValueError("CSVの文字コードを読み取れませんでした。UTF-8またはShift-JISで保存してください。")
+    raise ValueError(f"CSVを読み込めませんでした。UTF-8またはShift-JISで保存してください。詳細: {last_error}")
 
 
-def normalize_columns(df):
-    """
-    必要列の確認と整形
-    """
-    required_columns = ["商品名", "価格", "カテゴリ"]
+def pick_column(df, candidates):
+    """候補リストから実際に存在する列名を1つ選ぶ。"""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
 
-    missing = [col for col in required_columns if col not in df.columns]
+
+def normalize_products(df):
+    """商品名・価格・カテゴリの列名を統一し、価格を数値化する。"""
+    name_col = pick_column(df, NAME_COLUMNS)
+    price_col = pick_column(df, PRICE_COLUMNS)
+    category_col = pick_column(df, CATEGORY_COLUMNS)
+
+    missing = []
+    if name_col is None:
+        missing.append("商品名")
+    if price_col is None:
+        missing.append("価格")
+    if category_col is None:
+        missing.append("カテゴリ")
     if missing:
-        raise ValueError(f"CSVに必要な列がありません: {missing}")
+        raise ValueError(
+            "CSVに必要な列が見つかりません: " + ", ".join(missing) +
+            "\n列名は例として『商品名, 価格（税込み）, カテゴリ』にしてください。"
+        )
 
-    df = df[required_columns].copy()
+    products = df[[name_col, price_col, category_col]].copy()
+    products.columns = ["商品名", "価格", "カテゴリ"]
 
-    # 価格を数値化
-    df["価格"] = (
-        df["価格"]
+    products["価格"] = (
+        products["価格"]
         .astype(str)
         .str.replace(",", "", regex=False)
         .str.replace("円", "", regex=False)
         .str.strip()
     )
-    df["価格"] = pd.to_numeric(df["価格"], errors="coerce")
+    products["価格"] = pd.to_numeric(products["価格"], errors="coerce")
 
-    # 不正データ除外
-    df = df.dropna(subset=["商品名", "価格", "カテゴリ"])
-    df = df[df["価格"] > 0]
+    products["商品名"] = products["商品名"].astype(str).str.strip()
+    products["カテゴリ"] = products["カテゴリ"].astype(str).str.strip()
 
-    df["価格"] = df["価格"].astype(int)
-    df["商品名"] = df["商品名"].astype(str)
-    df["カテゴリ"] = df["カテゴリ"].astype(str)
+    products = products.dropna(subset=["商品名", "価格", "カテゴリ"])
+    products = products[products["商品名"] != ""]
+    products = products[products["カテゴリ"] != ""]
+    products = products[products["価格"] > 0]
+    products["価格"] = products["価格"].astype(int)
 
-    return df.reset_index(drop=True)
+    return products.reset_index(drop=True)
 
 
 # =========================================================
-# カテゴリ条件
+# カテゴリ偏り判定
 # =========================================================
-
 def is_category_balanced(combo, products):
-    """
-    combo: {商品index: 個数}
-    products: 商品DataFrame
-    """
+    """同じカテゴリばかりの組み合わせを除外する。"""
     total_items = sum(combo.values())
-
     if total_items < MIN_ITEMS_FOR_CATEGORY_CHECK:
         return True
 
     category_counter = Counter()
-
     for idx, qty in combo.items():
-        category = products.loc[idx, "カテゴリ"]
-        category_counter[category] += qty
+        category_counter[products.loc[idx, "カテゴリ"]] += qty
 
-    distinct_categories = len(category_counter)
-
-    if distinct_categories < MIN_DISTINCT_CATEGORIES:
+    # 2点以上買う場合は、原則2カテゴリ以上にする
+    if len(category_counter) < MIN_DISTINCT_CATEGORIES:
         return False
 
-    max_category_count = max(category_counter.values())
-    max_share = max_category_count / total_items
-
+    # 1カテゴリへの偏りが強すぎる場合は除外
+    max_share = max(category_counter.values()) / total_items
     if max_share > MAX_CATEGORY_SHARE:
         return False
 
@@ -111,103 +122,88 @@ def is_category_balanced(combo, products):
 # =========================================================
 # 組み合わせ探索
 # =========================================================
-
 def find_combinations(products, target_amount):
-    """
-    目標金額に近い商品の組み合わせを探す
-    """
-    min_total = target_amount - UNDER_ALLOWANCE
+    """目標金額に近い商品の組み合わせを探す。"""
+    min_total = max(0, target_amount - UNDER_ALLOWANCE)
     max_total = target_amount + OVER_ALLOWANCE
 
-    if min_total < 0:
-        min_total = 0
-
-    # dp[合計金額] = [combo, combo, ...]
-    # comboは {商品index: 個数}
+    # dp[合計金額] = [ {商品index: 個数}, ... ]
     dp = {0: [dict()]}
 
     for idx, row in products.iterrows():
         price = int(row["価格"])
-        new_dp = dict(dp)
+        new_dp = {s: combos[:] for s, combos in dp.items()}
 
         for current_sum, combos in dp.items():
             for combo in combos:
                 for qty in range(1, MAX_PER_ITEM + 1):
                     new_sum = current_sum + price * qty
-
                     if new_sum > max_total:
                         continue
 
                     new_combo = combo.copy()
                     new_combo[idx] = qty
 
-                    if new_sum not in new_dp:
-                        new_dp[new_sum] = []
+                    new_dp.setdefault(new_sum, []).append(new_combo)
 
-                    new_dp[new_sum].append(new_combo)
-
-                    # 組み合わせ数が増えすぎないよう制限
+                    # 重くなりすぎないよう、合計金額ごとに保持数を制限
                     if len(new_dp[new_sum]) > MAX_COMBOS_PER_SUM:
                         new_dp[new_sum] = new_dp[new_sum][:MAX_COMBOS_PER_SUM]
 
         dp = new_dp
 
     results = []
-
     for total, combos in dp.items():
         if min_total <= total <= max_total:
             for combo in combos:
                 if not combo:
                     continue
+                if not is_category_balanced(combo, products):
+                    continue
 
-                if is_category_balanced(combo, products):
-                    diff = total - target_amount
-                    total_items = sum(combo.values())
+                diff = total - target_amount
+                total_items = sum(combo.values())
+                category_count = len({products.loc[idx, "カテゴリ"] for idx in combo})
 
-                    results.append({
-                        "total": total,
-                        "diff": diff,
-                        "abs_diff": abs(diff),
-                        "total_items": total_items,
-                        "combo": combo
-                    })
+                results.append({
+                    "合計金額": total,
+                    "差額": diff,
+                    "絶対差額": abs(diff),
+                    "総点数": total_items,
+                    "カテゴリ数": category_count,
+                    "combo": combo,
+                })
 
-    # 近い順、次にオーバーしないもの優先、次に品数が少ない順
-    results = sorted(
-        results,
-        key=lambda x: (
-            x["abs_diff"],
-            1 if x["diff"] > 0 else 0,
-            x["total_items"]
-        )
-    )
-
+    # ぴったりに近い順 → 余り優先 → カテゴリ数が多い順 → 点数が少ない順
+    results.sort(key=lambda r: (r["絶対差額"], 1 if r["差額"] > 0 else 0, -r["カテゴリ数"], r["総点数"]))
     return results[:TOP_RESULTS]
 
 
 def combo_to_dataframe(combo, products):
     rows = []
-
     for idx, qty in combo.items():
-        name = products.loc[idx, "商品名"]
         price = int(products.loc[idx, "価格"])
-        category = products.loc[idx, "カテゴリ"]
-
         rows.append({
-            "商品名": name,
-            "カテゴリ": category,
+            "商品名": products.loc[idx, "商品名"],
+            "カテゴリ": products.loc[idx, "カテゴリ"],
             "単価": price,
             "個数": qty,
-            "小計": price * qty
+            "小計": price * qty,
         })
+    return pd.DataFrame(rows).sort_values(["カテゴリ", "商品名"]).reset_index(drop=True)
 
-    return pd.DataFrame(rows)
+
+def diff_label(diff):
+    if diff < 0:
+        return f"{abs(diff)}円余り"
+    if diff > 0:
+        return f"{diff}円オーバー"
+    return "ぴったり"
 
 
 # =========================================================
-# Streamlit画面
+# Streamlit UI
 # =========================================================
-
 st.set_page_config(
     page_title="購買ぴったり使い切りアプリ",
     page_icon="🛒",
@@ -215,83 +211,72 @@ st.set_page_config(
 )
 
 st.title("🛒 購買ぴったり使い切りアプリ")
-
-st.write(
-    "指定した金額にできるだけ近くなるように、購買の商品リストから組み合わせを探します。"
-)
+st.caption("CSVの商品リストから、指定金額にできるだけ近い組み合わせを探します。")
 
 with st.sidebar:
-    st.header("条件")
+    st.header("検索条件")
+    target_amount = st.number_input("使いたい金額 n 円", min_value=1, value=500, step=10)
 
-    target_amount = st.number_input(
-        "使いたい金額 n 円",
-        min_value=1,
-        value=500,
-        step=10
-    )
-
-    st.write("現在の条件")
-    st.write(f"- 同じ商品は最大 **{MAX_PER_ITEM}点** まで")
+    st.divider()
+    st.write("固定条件")
+    st.write(f"- 同じ商品は最大 **{MAX_PER_ITEM}点**")
     st.write(f"- 余りは **{UNDER_ALLOWANCE}円以内**")
     st.write(f"- オーバーは **{OVER_ALLOWANCE}円まで**")
-    st.write(f"- 表示候補数: **{TOP_RESULTS}件**")
-    st.write(f"- 1カテゴリの最大割合: **{int(MAX_CATEGORY_SHARE * 100)}%以下**")
+    st.write(f"- 表示候補数は最大 **{TOP_RESULTS}件**")
+    st.write(f"- 2点以上なら原則 **{MIN_DISTINCT_CATEGORIES}カテゴリ以上**")
+    st.write(f"- 1カテゴリの割合は **{int(MAX_CATEGORY_SHARE * 100)}%以下**")
 
-uploaded_file = st.file_uploader(
-    "商品リストCSVをアップロードしてください",
-    type=["csv"]
-)
+uploaded_file = st.file_uploader("商品リストCSVをアップロードしてください", type=["csv"])
 
-if uploaded_file is not None:
-    try:
-        products = read_csv_auto_encoding(uploaded_file)
-        products = normalize_columns(products)
+if uploaded_file is None:
+    st.info("まずCSVをアップロードしてください。例: 商品名, 価格（税込み）, カテゴリ")
+    st.stop()
 
-        st.subheader("読み込んだ商品リスト")
-        st.dataframe(products, use_container_width=True)
+try:
+    raw_df = read_csv_auto_encoding(uploaded_file)
+    products = normalize_products(raw_df)
 
-        if st.button("組み合わせを探す"):
-            results = find_combinations(products, target_amount)
+    st.subheader("読み込んだ商品リスト")
+    st.dataframe(products, use_container_width=True, hide_index=True)
 
-            st.subheader("検索結果")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("商品数", len(products))
+    col2.metric("カテゴリ数", products["カテゴリ"].nunique())
+    col3.metric("価格範囲", f"{products['価格'].min()}〜{products['価格'].max()}円")
 
-            if not results:
-                st.warning(
-                    "条件に合う組み合わせが見つかりませんでした。"
-                    "カテゴリ条件をゆるめるか、商品数を増やしてみてください。"
-                )
-            else:
-                for i, result in enumerate(results, start=1):
-                    total = result["total"]
-                    diff = result["diff"]
+    if st.button("組み合わせを探す", type="primary"):
+        results = find_combinations(products, int(target_amount))
 
-                    if diff < 0:
-                        diff_text = f"{abs(diff)}円余り"
-                    elif diff > 0:
-                        diff_text = f"{diff}円オーバー"
-                    else:
-                        diff_text = "ぴったり"
+        st.subheader("検索結果")
+        if not results:
+            st.warning(
+                "条件に合う組み合わせが見つかりませんでした。\n\n"
+                "目標金額を変える、商品リストを増やす、またはカテゴリ条件を少しゆるめてください。"
+            )
+        else:
+            summary_rows = []
+            for i, r in enumerate(results, start=1):
+                summary_rows.append({
+                    "候補": i,
+                    "合計金額": r["合計金額"],
+                    "差額": diff_label(r["差額"]),
+                    "総点数": r["総点数"],
+                    "カテゴリ数": r["カテゴリ数"],
+                })
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-                    with st.expander(
-                        f"候補{i}: 合計 {total}円 / {diff_text}",
-                        expanded=(i == 1)
-                    ):
-                        result_df = combo_to_dataframe(result["combo"], products)
-                        st.dataframe(result_df, use_container_width=True)
+            for i, r in enumerate(results, start=1):
+                with st.expander(f"候補{i}: 合計 {r['合計金額']}円 / {diff_label(r['差額'])}", expanded=(i == 1)):
+                    detail_df = combo_to_dataframe(r["combo"], products)
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
-                        category_summary = (
-                            result_df
-                            .groupby("カテゴリ")["個数"]
-                            .sum()
-                            .reset_index()
-                            .rename(columns={"個数": "カテゴリ別点数"})
-                        )
+                    category_summary = (
+                        detail_df.groupby("カテゴリ", as_index=False)["個数"]
+                        .sum()
+                        .rename(columns={"個数": "カテゴリ別点数"})
+                    )
+                    st.write("カテゴリ構成")
+                    st.dataframe(category_summary, use_container_width=True, hide_index=True)
 
-                        st.write("カテゴリ構成")
-                        st.dataframe(category_summary, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"エラーが発生しました: {e}")
-
-else:
-    st.info("まず商品リストCSVをアップロードしてください。")
+except Exception as e:
+    st.error(f"エラーが発生しました: {e}")
