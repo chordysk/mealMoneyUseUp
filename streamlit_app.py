@@ -255,7 +255,7 @@ if "target_amount" not in st.session_state:
 with st.sidebar:
     st.header("検索条件")
 
-    st.write("ショートカット")
+    # st.write("ショートカット")
     shortcut_cols = st.columns(len(TARGET_SHORTCUTS))
     for col, amount in zip(shortcut_cols, TARGET_SHORTCUTS):
         if col.button(f"{amount}円", use_container_width=True):
@@ -269,14 +269,6 @@ with st.sidebar:
     )
 
     st.divider()
-    st.write("データ更新")
-    if st.button("商品CSVを再読み込み", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.caption(f"CSVキャッシュ有効時間: {CSV_CACHE_TTL_SECONDS}秒")
-
-    st.divider()
     st.write("固定条件")
     st.write(f"- 同じ商品は最大 **{MAX_PER_ITEM}点**")
     st.write(f"- 余りは **{UNDER_ALLOWANCE}円以内**")
@@ -285,6 +277,15 @@ with st.sidebar:
     st.write(f"- 2点以上なら原則 **{MIN_DISTINCT_CATEGORIES}カテゴリ以上**")
     st.write(f"- 1カテゴリの割合は **{int(MAX_CATEGORY_SHARE * 100)}%以下**")
     st.write("- 探索前に商品リストを **ランダム化**")
+
+
+    st.divider()
+    st.write("データ更新")
+    if st.button("商品CSVを再読み込み", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.caption(f"CSVキャッシュ有効時間: {CSV_CACHE_TTL_SECONDS}秒")
 
 try:
     raw_df, source_label = read_products_source()
