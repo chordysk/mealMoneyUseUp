@@ -167,6 +167,7 @@ def shuffle_products_for_search(products):
 # 組み合わせ探索
 # =========================================================
 def find_combinations(products, target_amount):
+    products = shuffle_products_for_search(products)
     min_total = max(0, target_amount - UNDER_ALLOWANCE)
     max_total = target_amount + OVER_ALLOWANCE
     dp = {0: [dict()]}
