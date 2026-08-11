@@ -1,48 +1,34 @@
-import streamlit as st
-import pandas as pd
-from pathlib import Path
+import json
+import os
+import tempfile
 from collections import Counter
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 
 # =========================================================
-# 条件設定：ここを変えるだけで条件を調整できます
+# 条件設定
 # =========================================================
-MAX_PER_ITEM = 2              # 同じ商品は最大2点まで
-UNDER_ALLOWANCE = 10          # 余りは10円以内
-OVER_ALLOWANCE = 5            # オーバーは5円まで
-TOP_RESULTS = 20              # 表示する候補数
+MAX_PER_ITEM = 2
+UNDER_ALLOWANCE = 10
+OVER_ALLOWANCE = 5
+TOP_RESULTS = 20
+MAX_PURCHASE_HISTORY = 5
 
-# ---------------------------------------------------------
-# 商品CSVの読み込み設定
-# ---------------------------------------------------------
-# A. GitHubリポジトリ内のCSVを読む場合
-#    Streamlit Cloudでは、GitHub上のCSVを更新したあと「再デプロイ」されないと
-#    アプリ内のローカルファイル data/priceList.csv は古いままになることがあります。
 PRODUCT_CSV_PATH = Path("data/priceList.csv")
-
-# B. GitHubのRaw URLから直接CSVを読む場合
-#    CSV更新をアプリに反映しやすくしたい場合はこちらがおすすめです。
-#    例:
-#    PRODUCT_CSV_URL = "https://raw.githubusercontent.com/ユーザー名/リポジトリ名/main/data/priceList.csv"
-#    使わない場合は空文字のままでOKです。
 PRODUCT_CSV_URL = "https://github.com/chordysk/mealMoneyUseUp/raw/refs/heads/main/data/priceList.csv"
-
-# CSVキャッシュの有効時間 秒。
-# 0にするとキャッシュなし。300なら5分ごとに再取得。
 CSV_CACHE_TTL_SECONDS = 300
+PURCHASE_HISTORY_PATH = Path("data/purchase_history.json")
 
-# ショートカット金額ボタン
 TARGET_SHORTCUTS = [700, 1400, 2100]
 DEFAULT_TARGET_AMOUNT = 700
 
-# カテゴリ偏り防止条件
 MIN_ITEMS_FOR_CATEGORY_CHECK = 2
 MIN_DISTINCT_CATEGORIES = 2
 MAX_CATEGORY_SHARE = 0.70
-
-# 探索の上限。商品数が増えても重くなりすぎないようにするための設定
 MAX_COMBOS_PER_SUM = 200
 
-# CSV列名候補
 NAME_COLUMNS = ["商品名", "品名", "商品", "name"]
 PRICE_COLUMNS = ["価格", "価格（税込み）", "価格(税込み)", "税込価格", "税込み価格", "値段", "price"]
 CATEGORY_COLUMNS = ["カテゴリ", "カテゴリー", "分類", "category"]
@@ -52,41 +38,31 @@ CATEGORY_COLUMNS = ["カテゴリ", "カテゴリー", "分類", "category"]
 # CSV読み込み・整形
 # =========================================================
 def read_csv_with_encodings(source):
-    """ローカルPathまたはURLから、日本語CSVを読み込む。"""
     encodings = ["utf-8-sig", "utf-8", "cp932", "shift_jis"]
     last_error = None
-
     for enc in encodings:
         try:
             return pd.read_csv(source, encoding=enc)
         except Exception as e:
             last_error = e
+    raise ValueError(f"CSVを読み込めませんでした。詳細: {last_error}")
 
-    raise ValueError(f"CSVを読み込めませんでした。UTF-8またはShift-JISで保存してください。詳細: {last_error}")
 
-
-# ttl=0はStreamlitのバージョンによって挙動差が出る可能性があるため、
-# キャッシュなしの場合は別関数で読む。
 @st.cache_data(ttl=CSV_CACHE_TTL_SECONDS)
 def read_csv_cached(source: str, source_type: str):
-    """商品CSVをキャッシュ付きで読み込む。source_typeはキャッシュキーを明確にするために使う。"""
     if source_type == "url":
         return read_csv_with_encodings(source)
 
     path = Path(source)
     if not path.exists():
-        raise FileNotFoundError(
-            f"商品CSVが見つかりません: {path}\n"
-            "GitHubリポジトリ内に data/priceList.csv を置いてください。"
-        )
+        raise FileNotFoundError(f"商品CSVが見つかりません: {path}")
     return read_csv_with_encodings(path)
 
 
 def read_products_source():
-    """設定に応じて、Raw URLまたはリポジトリ内CSVから読み込む。"""
     if PRODUCT_CSV_URL.strip():
-        return read_csv_cached(PRODUCT_CSV_URL.strip(), "url"), PRODUCT_CSV_URL.strip()
-
+        url = PRODUCT_CSV_URL.strip()
+        return read_csv_cached(url, "url"), url
     return read_csv_cached(str(PRODUCT_CSV_PATH), "local"), str(PRODUCT_CSV_PATH)
 
 
@@ -110,109 +86,102 @@ def normalize_products(df):
     if category_col is None:
         missing.append("カテゴリ")
     if missing:
-        raise ValueError(
-            "CSVに必要な列が見つかりません: " + ", ".join(missing) +
-            "\n列名は例として『商品名, 価格（税込み）, カテゴリ』にしてください。"
-        )
+        raise ValueError("CSVに必要な列がありません: " + ", ".join(missing))
 
     products = df[[name_col, price_col, category_col]].copy()
     products.columns = ["商品名", "価格", "カテゴリ"]
-
     products["価格"] = (
-        products["価格"]
-        .astype(str)
+        products["価格"].astype(str)
         .str.replace(",", "", regex=False)
         .str.replace("円", "", regex=False)
         .str.strip()
     )
     products["価格"] = pd.to_numeric(products["価格"], errors="coerce")
-
     products["商品名"] = products["商品名"].astype(str).str.strip()
     products["カテゴリ"] = products["カテゴリ"].astype(str).str.strip()
-
     products = products.dropna(subset=["商品名", "価格", "カテゴリ"])
-    products = products[products["商品名"] != ""]
-    products = products[products["カテゴリ"] != ""]
-    products = products[products["価格"] > 0]
+    products = products[
+        (products["商品名"] != "")
+        & (products["カテゴリ"] != "")
+        & (products["価格"] > 0)
+    ]
     products["価格"] = products["価格"].astype(int)
-
-    return products.reset_index(drop=True)
+    return products.drop_duplicates(subset=["商品名"], keep="first").reset_index(drop=True)
 
 
 # =========================================================
-# カテゴリ偏り判定
+# 購入履歴
 # =========================================================
-def is_category_balanced(combo, products):
-    total_items = sum(combo.values())
+def load_purchase_history():
+    """購入履歴を最大5回読み込む。読み込めない場合は空にする。"""
+    if not PURCHASE_HISTORY_PATH.exists():
+        return []
+    try:
+        with PURCHASE_HISTORY_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data[:MAX_PURCHASE_HISTORY] if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_purchase_history(history):
+    """一時ファイルを使って購入履歴を安全に保存する。"""
+    PURCHASE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    history = history[:MAX_PURCHASE_HISTORY]
+    fd, temp_path = tempfile.mkstemp(
+        prefix="purchase_history_", suffix=".json", dir=str(PURCHASE_HISTORY_PATH.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, PURCHASE_HISTORY_PATH)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def record_purchase(detail_df, target_amount):
+    items = detail_df[["商品名", "カテゴリ", "単価", "個数", "小計"]].to_dict("records")
+    entry = {
+        "購入日時": pd.Timestamp.now(tz="Asia/Tokyo").strftime("%Y-%m-%d %H:%M:%S"),
+        "設定金額": int(target_amount),
+        "合計金額": int(detail_df["小計"].sum()),
+        "商品": items,
+    }
+    history = [entry] + st.session_state.purchase_history
+    st.session_state.purchase_history = history[:MAX_PURCHASE_HISTORY]
+    try:
+        save_purchase_history(st.session_state.purchase_history)
+        return True, "購入履歴に保存しました。"
+    except OSError as e:
+        return False, f"このセッションには保存しましたが、ファイル保存に失敗しました: {e}"
+
+
+def purchased_product_names(history):
+    names = []
+    for purchase in history:
+        for item in purchase.get("商品", []):
+            name = item.get("商品名")
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+# =========================================================
+# 探索処理
+# =========================================================
+def is_detail_category_balanced(detail_df):
+    total_items = int(detail_df["個数"].sum())
     if total_items < MIN_ITEMS_FOR_CATEGORY_CHECK:
         return True
-
-    category_counter = Counter()
-    for idx, qty in combo.items():
-        category_counter[products.loc[idx, "カテゴリ"]] += qty
-
-    if len(category_counter) < MIN_DISTINCT_CATEGORIES:
+    counts = detail_df.groupby("カテゴリ")["個数"].sum()
+    if len(counts) < MIN_DISTINCT_CATEGORIES:
         return False
-
-    max_share = max(category_counter.values()) / total_items
-    return max_share <= MAX_CATEGORY_SHARE
+    return float(counts.max() / total_items) <= MAX_CATEGORY_SHARE
 
 
 def shuffle_products_for_search(products):
-    """探索前に商品リストの順番をランダム化する。"""
     return products.sample(frac=1).reset_index(drop=True)
-
-
-# =========================================================
-# 組み合わせ探索
-# =========================================================
-def find_combinations(products, target_amount):
-    min_total = max(0, target_amount - UNDER_ALLOWANCE)
-    max_total = target_amount + OVER_ALLOWANCE
-    dp = {0: [dict()]}
-
-    for idx, row in products.iterrows():
-        price = int(row["価格"])
-        new_dp = {s: combos[:] for s, combos in dp.items()}
-
-        for current_sum, combos in dp.items():
-            for combo in combos:
-                for qty in range(1, MAX_PER_ITEM + 1):
-                    new_sum = current_sum + price * qty
-                    if new_sum > max_total:
-                        continue
-
-                    new_combo = combo.copy()
-                    new_combo[idx] = qty
-                    new_dp.setdefault(new_sum, []).append(new_combo)
-
-                    if len(new_dp[new_sum]) > MAX_COMBOS_PER_SUM:
-                        new_dp[new_sum] = new_dp[new_sum][:MAX_COMBOS_PER_SUM]
-
-        dp = new_dp
-
-    results = []
-    for total, combos in dp.items():
-        if min_total <= total <= max_total:
-            for combo in combos:
-                if not combo or not is_category_balanced(combo, products):
-                    continue
-
-                diff = total - target_amount
-                total_items = sum(combo.values())
-                category_count = len({products.loc[idx, "カテゴリ"] for idx in combo})
-
-                results.append({
-                    "合計金額": total,
-                    "差額": diff,
-                    "絶対差額": abs(diff),
-                    "総点数": total_items,
-                    "カテゴリ数": category_count,
-                    "combo": combo,
-                })
-
-    results.sort(key=lambda r: (r["絶対差額"], 1 if r["差額"] > 0 else 0, -r["カテゴリ数"], r["総点数"]))
-    return results[:TOP_RESULTS]
 
 
 def combo_to_dataframe(combo, products):
@@ -223,10 +192,83 @@ def combo_to_dataframe(combo, products):
             "商品名": products.loc[idx, "商品名"],
             "カテゴリ": products.loc[idx, "カテゴリ"],
             "単価": price,
-            "個数": qty,
-            "小計": price * qty,
+            "個数": int(qty),
+            "小計": price * int(qty),
         })
-    return pd.DataFrame(rows).sort_values(["カテゴリ", "商品名"]).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "個数", "小計"])
+    return pd.DataFrame(rows)
+
+
+def merge_required_items(combo_df, required_df):
+    frames = [df for df in [combo_df, required_df] if not df.empty]
+    if not frames:
+        return pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "個数", "小計"])
+    merged = pd.concat(frames, ignore_index=True)
+    merged = (
+        merged.groupby(["商品名", "カテゴリ", "単価"], as_index=False)["個数"]
+        .sum()
+    )
+    merged["小計"] = merged["単価"] * merged["個数"]
+    return merged.sort_values(["カテゴリ", "商品名"]).reset_index(drop=True)
+
+
+def find_combinations(products, remaining_target, original_target, required_df):
+    """必須商品の金額を差し引いた残額について組み合わせを探索する。"""
+    min_total = max(0, remaining_target - UNDER_ALLOWANCE)
+    max_total = remaining_target + OVER_ALLOWANCE
+    dp = {0: [dict()]}
+
+    for idx, row in products.iterrows():
+        price = int(row["価格"])
+        new_dp = {total: combos[:] for total, combos in dp.items()}
+        for current_sum, combos in dp.items():
+            for combo in combos:
+                for qty in range(1, MAX_PER_ITEM + 1):
+                    new_sum = current_sum + price * qty
+                    if new_sum > max_total:
+                        continue
+                    new_combo = combo.copy()
+                    new_combo[idx] = qty
+                    new_dp.setdefault(new_sum, []).append(new_combo)
+                    if len(new_dp[new_sum]) > MAX_COMBOS_PER_SUM:
+                        new_dp[new_sum] = new_dp[new_sum][:MAX_COMBOS_PER_SUM]
+        dp = new_dp
+
+    required_total = int(required_df["小計"].sum()) if not required_df.empty else 0
+    results = []
+    for remaining_total, combos in dp.items():
+        if not (min_total <= remaining_total <= max_total):
+            continue
+        for combo in combos:
+            # 残額0円の場合は空の組み合わせも有効。必須商品だけで候補を作れる。
+            if not combo and required_df.empty:
+                continue
+            combo_df = combo_to_dataframe(combo, products)
+            detail_df = merge_required_items(combo_df, required_df)
+            if not is_detail_category_balanced(detail_df):
+                continue
+
+            full_total = remaining_total + required_total
+            diff = full_total - original_target
+            results.append({
+                "合計金額": full_total,
+                "差額": diff,
+                "絶対差額": abs(diff),
+                "総点数": int(detail_df["個数"].sum()),
+                "カテゴリ数": int(detail_df["カテゴリ"].nunique()),
+                "detail": detail_df.to_dict("records"),
+            })
+
+    results.sort(
+        key=lambda r: (
+            r["絶対差額"],
+            1 if r["差額"] > 0 else 0,
+            -r["カテゴリ数"],
+            r["総点数"],
+        )
+    )
+    return results[:TOP_RESULTS]
 
 
 def diff_label(diff):
@@ -240,108 +282,168 @@ def diff_label(diff):
 # =========================================================
 # Streamlit UI
 # =========================================================
-st.set_page_config(
-    page_title="購買ぴったり使い切りアプリ",
-    page_icon="🛒",
-    layout="wide"
-)
-
+st.set_page_config(page_title="購買ぴったり使い切りアプリ", page_icon="🛒", layout="wide")
 st.title("🛒 購買ぴったり使い切りアプリ")
-st.caption("固定CSVから、指定金額に近い組み合わせを探します。")
+st.caption("必須商品・除外商品・直近5回の購入履歴に対応しています。")
 
 if "target_amount" not in st.session_state:
     st.session_state.target_amount = DEFAULT_TARGET_AMOUNT
-
-with st.sidebar:
-    st.header("検索条件")
-
-    # st.write("ショートカット")
-    shortcut_cols = st.columns(len(TARGET_SHORTCUTS))
-    for col, amount in zip(shortcut_cols, TARGET_SHORTCUTS):
-        if col.button(f"{amount}円", use_container_width=True):
-            st.session_state.target_amount = amount
-
-    target_amount = st.number_input(
-        "使いたい金額 n 円",
-        min_value=1,
-        step=10,
-        key="target_amount"
-    )
-
-    st.divider()
-    st.write("固定条件")
-    st.write(f"- 同じ商品は最大 **{MAX_PER_ITEM}点**")
-    st.write(f"- 余りは **{UNDER_ALLOWANCE}円以内**")
-    st.write(f"- オーバーは **{OVER_ALLOWANCE}円まで**")
-    st.write(f"- 表示候補数は最大 **{TOP_RESULTS}件**")
-    st.write(f"- 2点以上なら原則 **{MIN_DISTINCT_CATEGORIES}カテゴリ以上**")
-    st.write(f"- 1カテゴリの割合は **{int(MAX_CATEGORY_SHARE * 100)}%以下**")
-    st.write("- 探索前に商品リストを **ランダム化**")
-
-
-    st.divider()
-    st.write("データ更新")
-    if st.button("商品CSVを再読み込み", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.caption(f"CSVキャッシュ有効時間: {CSV_CACHE_TTL_SECONDS}秒")
+if "purchase_history" not in st.session_state:
+    st.session_state.purchase_history = load_purchase_history()
+if "search_results" not in st.session_state:
+    st.session_state.search_results = []
+if "search_target" not in st.session_state:
+    st.session_state.search_target = None
 
 try:
     raw_df, source_label = read_products_source()
     products = normalize_products(raw_df)
+    all_product_names = products["商品名"].tolist()
+    history_names = purchased_product_names(st.session_state.purchase_history)
 
-    st.subheader("商品リスト")
-    st.caption(f"読み込み元: `{source_label}`")
-    if PRODUCT_CSV_URL.strip():
-        st.info("GitHub Raw URLからCSVを読んでいます。CSV更新後、最大でキャッシュ有効時間ぶん反映が遅れる場合があります。すぐ反映したい場合はサイドバーの『商品CSVを再読み込み』を押してください。")
+    with st.sidebar:
+        st.header("検索条件")
+        shortcut_cols = st.columns(len(TARGET_SHORTCUTS))
+        for col, amount in zip(shortcut_cols, TARGET_SHORTCUTS):
+            if col.button(f"{amount}円", use_container_width=True):
+                st.session_state.target_amount = amount
+
+        target_amount = st.number_input(
+            "使いたい金額 n 円", min_value=1, step=10, key="target_amount"
+        )
+
+        st.divider()
+        st.subheader("必須購入商品")
+        required_names = st.multiselect(
+            "必ず1点購入する商品",
+            options=all_product_names,
+            default=[],
+            help="選んだ商品は1点ずつ必須にし、その金額を目標金額から先に差し引きます。",
+        )
+
+        st.subheader("除外商品")
+        history_excluded = st.multiselect(
+            "購入済み商品から除外",
+            options=history_names,
+            default=[],
+            help="直近5回の購入履歴に含まれる商品だけを表示しています。",
+        )
+        all_excluded = st.multiselect(
+            "全商品リストから除外",
+            options=all_product_names,
+            default=[],
+        )
+        excluded_names = sorted(set(history_excluded) | set(all_excluded))
+
+        overlap = sorted(set(required_names) & set(excluded_names))
+        if overlap:
+            st.error("必須商品と除外商品が重複しています: " + "、".join(overlap))
+
+        st.divider()
+        st.write("データ更新")
+        if st.button("商品CSVを再読み込み", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.search_results = []
+            st.rerun()
+
+    # 必須商品の明細を1点ずつ作る
+    required_df = products[products["商品名"].isin(required_names)].copy()
+    required_df = required_df.rename(columns={"価格": "単価"})
+    if not required_df.empty:
+        required_df["個数"] = 1
+        required_df["小計"] = required_df["単価"]
+        required_df = required_df[["商品名", "カテゴリ", "単価", "個数", "小計"]]
     else:
-        st.warning("リポジトリ内CSVを読んでいます。Streamlit Cloudでは、GitHub上のCSV更新後にアプリの再デプロイが必要になる場合があります。CSVだけ頻繁に更新するなら PRODUCT_CSV_URL にGitHub Raw URLを設定してください。")
+        required_df = pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "個数", "小計"])
 
-    st.dataframe(products, use_container_width=True, hide_index=True)
+    required_total = int(required_df["小計"].sum()) if not required_df.empty else 0
+    remaining_target = int(target_amount) - required_total
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("商品数", len(products))
-    col2.metric("カテゴリ数", products["カテゴリ"].nunique())
-    col3.metric("価格範囲", f"{products['価格'].min()}〜{products['価格'].max()}円")
+    st.subheader("現在の指定")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("使いたい金額", f"{int(target_amount)}円")
+    c2.metric("必須商品の合計", f"{required_total}円")
+    c3.metric("残りの探索金額", f"{remaining_target}円")
 
-    if st.button("組み合わせを探す", type="primary"):
-        search_products = shuffle_products_for_search(products)
-        results = find_combinations(search_products, int(target_amount))
+    if required_names:
+        st.write("**必須購入商品**")
+        st.dataframe(required_df, use_container_width=True, hide_index=True)
+    if excluded_names:
+        st.write("**除外中の商品:** " + "、".join(excluded_names))
 
-        st.subheader("検索結果")
-        st.caption("※ 探索前に商品順をランダム化しているため、同じ金額でも再検索すると候補が変わる場合があります。")
+    search_disabled = bool(overlap) or remaining_target < 0
+    if remaining_target < 0:
+        st.error("必須商品の合計が、使いたい金額を超えています。")
 
-        if not results:
-            st.warning(
-                "条件に合う組み合わせが見つかりませんでした。\n\n"
-                "目標金額を変える、商品リストを増やす、またはカテゴリ条件を少しゆるめてください。"
-            )
-        else:
-            summary_rows = []
-            for i, r in enumerate(results, start=1):
-                summary_rows.append({
-                    "候補": i,
-                    "合計金額": r["合計金額"],
-                    "差額": diff_label(r["差額"]),
-                    "総点数": r["総点数"],
-                    "カテゴリ数": r["カテゴリ数"],
-                })
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    if st.button("組み合わせを探す", type="primary", disabled=search_disabled):
+        # 必須商品と除外商品は、探索対象から完全に外す。
+        blocked_names = set(required_names) | set(excluded_names)
+        search_pool = products[~products["商品名"].isin(blocked_names)].copy()
+        search_pool = shuffle_products_for_search(search_pool)
 
-            for i, r in enumerate(results, start=1):
-                with st.expander(f"候補{i}: 合計 {r['合計金額']}円 / {diff_label(r['差額'])}", expanded=(i == 1)):
-                    detail_df = combo_to_dataframe(r["combo"], search_products)
-                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+        st.session_state.search_results = find_combinations(
+            search_pool,
+            remaining_target=remaining_target,
+            original_target=int(target_amount),
+            required_df=required_df,
+        )
+        st.session_state.search_target = int(target_amount)
 
-                    category_summary = (
-                        detail_df.groupby("カテゴリ", as_index=False)["個数"]
-                        .sum()
-                        .rename(columns={"個数": "カテゴリ別点数"})
+    if st.session_state.search_results:
+        st.subheader("購入商品候補")
+        st.caption("必須商品は各候補に追加済みです。購入すると、候補全体を直近5回の履歴に保存します。")
+
+        for i, result in enumerate(st.session_state.search_results, start=1):
+            detail_df = pd.DataFrame(result["detail"])
+            with st.container(border=True):
+                st.markdown(
+                    f"### 候補{i}: 合計 {result['合計金額']}円 / {diff_label(result['差額'])}"
+                )
+                st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                button_col, info_col = st.columns([1, 4])
+                if button_col.button("購入", key=f"purchase_{i}", type="primary", use_container_width=True):
+                    success, message = record_purchase(
+                        detail_df,
+                        st.session_state.search_target or int(target_amount),
                     )
-                    st.write("カテゴリ構成")
-                    st.dataframe(category_summary, use_container_width=True, hide_index=True)
+                    if success:
+                        st.success(message)
+                    else:
+                        st.warning(message)
+                    st.session_state.search_results = []
+                    st.rerun()
+                info_col.caption(
+                    f"{result['総点数']}点・{result['カテゴリ数']}カテゴリ"
+                )
+    elif st.session_state.search_target is not None:
+        st.info("検索結果がありません。条件を変更して再検索してください。")
+
+    st.divider()
+    st.subheader("直近5回の購入履歴")
+    if not st.session_state.purchase_history:
+        st.info("購入履歴はまだありません。候補の「購入」ボタンから登録できます。")
+    else:
+        for i, purchase in enumerate(st.session_state.purchase_history, start=1):
+            title = (
+                f"{i}. {purchase.get('購入日時', '日時不明')} / "
+                f"合計 {purchase.get('合計金額', 0)}円"
+            )
+            with st.expander(title, expanded=(i == 1)):
+                st.dataframe(pd.DataFrame(purchase.get("商品", [])), use_container_width=True, hide_index=True)
+
+        if st.button("購入履歴をすべて削除"):
+            st.session_state.purchase_history = []
+            try:
+                save_purchase_history([])
+            except OSError:
+                pass
+            st.rerun()
+
+    with st.expander("商品リストを確認"):
+        st.caption(f"読み込み元: {source_label}")
+        st.dataframe(products, use_container_width=True, hide_index=True)
 
 except Exception as e:
     st.error(f"エラーが発生しました: {e}")
-    st.info("`data/priceList.csv` があるか、または `PRODUCT_CSV_URL` が正しいか確認してください。")
+    st.info("商品CSVのURL、列名、文字コードを確認してください。")
