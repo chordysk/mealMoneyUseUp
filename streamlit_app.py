@@ -3,6 +3,8 @@ import os
 import tempfile
 from collections import Counter
 from pathlib import Path
+from time import time_ns
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 import streamlit as st
@@ -61,10 +63,26 @@ def read_csv_cached(source: str, source_type: str):
     return read_csv_with_encodings(path)
 
 
+def add_cache_buster(url: str) -> str:
+    """GitHub/CDNの古い応答を避けるため、毎回異なるクエリをURLに付ける。"""
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["refresh"] = str(time_ns())
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
 def read_products_source():
+    """
+    ページ実行のたびにGitHub上のCSVを再取得する。
+    列チェックより前に最新CSVを読み込むため、追加直後の「カロリー」列も反映される。
+    """
     if PRODUCT_CSV_URL.strip():
-        url = PRODUCT_CSV_URL.strip()
-        return read_csv_cached(url, "url"), url
+        original_url = PRODUCT_CSV_URL.strip()
+        live_url = add_cache_buster(original_url)
+        # URL読み込みにはst.cache_dataを使わず、毎回ネットワークから取得する。
+        return read_csv_with_encodings(live_url), original_url
+
+    # URL未設定時のみ、リポジトリ内のローカルCSVを使用する。
     return read_csv_cached(str(PRODUCT_CSV_PATH), "local"), str(PRODUCT_CSV_PATH)
 
 
@@ -305,7 +323,7 @@ def diff_label(diff):
 # =========================================================
 st.set_page_config(page_title="購買ぴったり使い切りアプリ", page_icon="🛒", layout="wide")
 st.title("🛒 購買ぴったり使い切りアプリ")
-st.caption("必須商品・除外商品・直近5回の購入履歴に対応しています。")
+st.caption("ページ実行時にGitHubの最新CSVを取得します。必須商品・除外商品・直近5回の購入履歴にも対応しています。")
 
 if "target_amount" not in st.session_state:
     st.session_state.target_amount = DEFAULT_TARGET_AMOUNT
