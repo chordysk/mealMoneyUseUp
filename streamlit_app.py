@@ -32,6 +32,8 @@ MAX_COMBOS_PER_SUM = 200
 NAME_COLUMNS = ["商品名", "品名", "商品", "name"]
 PRICE_COLUMNS = ["価格", "価格（税込み）", "価格(税込み)", "税込価格", "税込み価格", "値段", "price"]
 CATEGORY_COLUMNS = ["カテゴリ", "カテゴリー", "分類", "category"]
+CALORIE_COLUMNS = ["カロリー", "熱量", "calorie", "calories", "kcal"]
+DEFAULT_TARGET_CALORIES = 800
 
 
 # =========================================================
@@ -77,6 +79,7 @@ def normalize_products(df):
     name_col = pick_column(df, NAME_COLUMNS)
     price_col = pick_column(df, PRICE_COLUMNS)
     category_col = pick_column(df, CATEGORY_COLUMNS)
+    calorie_col = pick_column(df, CALORIE_COLUMNS)
 
     missing = []
     if name_col is None:
@@ -85,11 +88,13 @@ def normalize_products(df):
         missing.append("価格")
     if category_col is None:
         missing.append("カテゴリ")
+    if calorie_col is None:
+        missing.append("カロリー")
     if missing:
         raise ValueError("CSVに必要な列がありません: " + ", ".join(missing))
 
-    products = df[[name_col, price_col, category_col]].copy()
-    products.columns = ["商品名", "価格", "カテゴリ"]
+    products = df[[name_col, price_col, category_col, calorie_col]].copy()
+    products.columns = ["商品名", "価格", "カテゴリ", "カロリー"]
     products["価格"] = (
         products["価格"].astype(str)
         .str.replace(",", "", regex=False)
@@ -97,15 +102,25 @@ def normalize_products(df):
         .str.strip()
     )
     products["価格"] = pd.to_numeric(products["価格"], errors="coerce")
+    products["カロリー"] = (
+        products["カロリー"].astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("kcal", "", case=False, regex=False)
+        .str.replace("キロカロリー", "", regex=False)
+        .str.strip()
+    )
+    products["カロリー"] = pd.to_numeric(products["カロリー"], errors="coerce")
     products["商品名"] = products["商品名"].astype(str).str.strip()
     products["カテゴリ"] = products["カテゴリ"].astype(str).str.strip()
-    products = products.dropna(subset=["商品名", "価格", "カテゴリ"])
+    products = products.dropna(subset=["商品名", "価格", "カテゴリ", "カロリー"])
     products = products[
         (products["商品名"] != "")
         & (products["カテゴリ"] != "")
         & (products["価格"] > 0)
+        & (products["カロリー"] >= 0)
     ]
     products["価格"] = products["価格"].astype(int)
+    products["カロリー"] = products["カロリー"].astype(float)
     return products.drop_duplicates(subset=["商品名"], keep="first").reset_index(drop=True)
 
 
@@ -141,11 +156,12 @@ def save_purchase_history(history):
 
 
 def record_purchase(detail_df, target_amount):
-    items = detail_df[["商品名", "カテゴリ", "単価", "個数", "小計"]].to_dict("records")
+    items = detail_df[["商品名", "カテゴリ", "単価", "カロリー", "個数", "小計", "合計カロリー"]].to_dict("records")
     entry = {
         "購入日時": pd.Timestamp.now(tz="Asia/Tokyo").strftime("%Y-%m-%d %H:%M:%S"),
         "設定金額": int(target_amount),
         "合計金額": int(detail_df["小計"].sum()),
+        "合計カロリー": float(detail_df["合計カロリー"].sum()),
         "商品": items,
     }
     history = [entry] + st.session_state.purchase_history
@@ -188,28 +204,32 @@ def combo_to_dataframe(combo, products):
     rows = []
     for idx, qty in combo.items():
         price = int(products.loc[idx, "価格"])
+        calorie = float(products.loc[idx, "カロリー"])
         rows.append({
             "商品名": products.loc[idx, "商品名"],
             "カテゴリ": products.loc[idx, "カテゴリ"],
             "単価": price,
+            "カロリー": calorie,
             "個数": int(qty),
             "小計": price * int(qty),
+            "合計カロリー": calorie * int(qty),
         })
     if not rows:
-        return pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "個数", "小計"])
+        return pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "カロリー", "個数", "小計", "合計カロリー"])
     return pd.DataFrame(rows)
 
 
 def merge_required_items(combo_df, required_df):
     frames = [df for df in [combo_df, required_df] if not df.empty]
     if not frames:
-        return pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "個数", "小計"])
+        return pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "カロリー", "個数", "小計", "合計カロリー"])
     merged = pd.concat(frames, ignore_index=True)
     merged = (
-        merged.groupby(["商品名", "カテゴリ", "単価"], as_index=False)["個数"]
+        merged.groupby(["商品名", "カテゴリ", "単価", "カロリー"], as_index=False)["個数"]
         .sum()
     )
     merged["小計"] = merged["単価"] * merged["個数"]
+    merged["合計カロリー"] = merged["カロリー"] * merged["個数"]
     return merged.sort_values(["カテゴリ", "商品名"]).reset_index(drop=True)
 
 
@@ -257,6 +277,7 @@ def find_combinations(products, remaining_target, original_target, required_df):
                 "絶対差額": abs(diff),
                 "総点数": int(detail_df["個数"].sum()),
                 "カテゴリ数": int(detail_df["カテゴリ"].nunique()),
+                "合計カロリー": float(detail_df["合計カロリー"].sum()),
                 "detail": detail_df.to_dict("records"),
             })
 
@@ -294,6 +315,8 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = []
 if "search_target" not in st.session_state:
     st.session_state.search_target = None
+if "target_calories" not in st.session_state:
+    st.session_state.target_calories = DEFAULT_TARGET_CALORIES
 
 try:
     raw_df, source_label = read_products_source()
@@ -310,6 +333,20 @@ try:
 
         target_amount = st.number_input(
             "使いたい金額 n 円", min_value=1, step=10, key="target_amount"
+        )
+
+        st.subheader("カロリー設定")
+        target_calories = st.number_input(
+            "目標カロリー（kcal）",
+            min_value=0,
+            step=50,
+            key="target_calories",
+            help="『目標カロリーに近い順』で候補を並べるときに使用します。",
+        )
+        calorie_sort = st.selectbox(
+            "候補の並び替え",
+            options=["合計カロリー高い順", "合計カロリー低い順", "目標カロリーに近い順"],
+            index=2,
         )
 
         st.divider()
@@ -352,9 +389,10 @@ try:
     if not required_df.empty:
         required_df["個数"] = 1
         required_df["小計"] = required_df["単価"]
-        required_df = required_df[["商品名", "カテゴリ", "単価", "個数", "小計"]]
+        required_df["合計カロリー"] = required_df["カロリー"]
+        required_df = required_df[["商品名", "カテゴリ", "単価", "カロリー", "個数", "小計", "合計カロリー"]]
     else:
-        required_df = pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "個数", "小計"])
+        required_df = pd.DataFrame(columns=["商品名", "カテゴリ", "単価", "カロリー", "個数", "小計", "合計カロリー"])
 
     required_total = int(required_df["小計"].sum()) if not required_df.empty else 0
     remaining_target = int(target_amount) - required_total
@@ -393,11 +431,24 @@ try:
         st.subheader("購入商品候補")
         st.caption("必須商品は各候補に追加済みです。購入すると、候補全体を直近5回の履歴に保存します。")
 
-        for i, result in enumerate(st.session_state.search_results, start=1):
+        displayed_results = list(st.session_state.search_results)
+        if calorie_sort == "合計カロリー高い順":
+            displayed_results.sort(key=lambda r: r["合計カロリー"], reverse=True)
+        elif calorie_sort == "合計カロリー低い順":
+            displayed_results.sort(key=lambda r: r["合計カロリー"])
+        else:
+            displayed_results.sort(
+                key=lambda r: (abs(r["合計カロリー"] - float(target_calories)), r["絶対差額"])
+            )
+
+        st.caption(f"並び替え: {calorie_sort} / 目標 {float(target_calories):g} kcal")
+
+        for i, result in enumerate(displayed_results, start=1):
             detail_df = pd.DataFrame(result["detail"])
             with st.container(border=True):
                 st.markdown(
-                    f"### 候補{i}: 合計 {result['合計金額']}円 / {diff_label(result['差額'])}"
+                    f"### 候補{i}: 合計 {result['合計金額']}円 / "
+                    f"{diff_label(result['差額'])} / {result['合計カロリー']:g} kcal"
                 )
                 st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
@@ -414,7 +465,8 @@ try:
                     st.session_state.search_results = []
                     st.rerun()
                 info_col.caption(
-                    f"{result['総点数']}点・{result['カテゴリ数']}カテゴリ"
+                    f"{result['総点数']}点・{result['カテゴリ数']}カテゴリ・"
+                    f"目標カロリーとの差 {abs(result['合計カロリー'] - float(target_calories)):g} kcal"
                 )
     elif st.session_state.search_target is not None:
         st.info("検索結果がありません。条件を変更して再検索してください。")
@@ -427,7 +479,7 @@ try:
         for i, purchase in enumerate(st.session_state.purchase_history, start=1):
             title = (
                 f"{i}. {purchase.get('購入日時', '日時不明')} / "
-                f"合計 {purchase.get('合計金額', 0)}円"
+                f"合計 {purchase.get('合計金額', 0)}円 / {purchase.get('合計カロリー', 0):g} kcal"
             )
             with st.expander(title, expanded=(i == 1)):
                 st.dataframe(pd.DataFrame(purchase.get("商品", [])), use_container_width=True, hide_index=True)
