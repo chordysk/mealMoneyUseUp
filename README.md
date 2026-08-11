@@ -1,23 +1,9 @@
 # 購買ぴったり使い切りアプリ
 
-## GitHubのCSV更新が反映されない場合
 
-原因は主に2つあります。
-
-1. `@st.cache_data` によりCSV読み込み結果がキャッシュされている
-2. Streamlit Cloudでリポジトリ内ファイル `data/priceList.csv` を読んでいる場合、GitHubのCSVを更新してもアプリ側の実行環境が古いファイルを持っていることがある
-
-## おすすめ設定
-
-CSVを頻繁に更新する場合は、`app.py` の `PRODUCT_CSV_URL` にGitHub Raw URLを設定してください。
-
-```python
-PRODUCT_CSV_URL = "https://raw.githubusercontent.com/ユーザー名/リポジトリ名/main/data/priceList.csv"
-```
-
-CSVをURLから読む設定にすると、アプリの再デプロイなしでも更新を反映しやすくなります。
-ただし、アプリ側では `CSV_CACHE_TTL_SECONDS = 300` としているので、最大5分程度遅れる場合があります。
-すぐ反映したい場合は、サイドバーの「商品CSVを再読み込み」ボタンを押してください。
+ミールマネーを購買の商品でぴったり使い切ろう！
+買いたい商品の指定
+カロリー並び替え
 
 ## リポジトリ構成
 
